@@ -1,0 +1,64 @@
+# Local infrastructure for flashdrop.
+#   Start:  docker compose up -d
+#   Stop:   docker compose down        (add -v to also wipe the data volumes)
+#   Status: docker compose ps
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: flashdrop-postgres
+    environment:
+      POSTGRES_DB: flashdrop
+      POSTGRES_USER: flashdrop
+      POSTGRES_PASSWORD: flashdrop
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flashdrop -d flashdrop"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mongo:
+    image: mongo:8.0
+    container_name: flashdrop-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Single-node Kafka in KRaft mode (no ZooKeeper). The image's defaults advertise
+  # localhost:9092, which is what the Spring app on your laptop connects to.
+  kafka:
+    image: apache/kafka:4.0.0
+    container_name: flashdrop-kafka
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  redis:
+      image: redis:7.4-alpine
+      container_name: flashdrop-redis
+      ports:
+        - "6379:6379"
+      volumes:
+        - redis-data:/data
+      healthcheck:
+        test: [ "CMD", "redis-cli", "ping" ]
+        interval: 5s
+        timeout: 3s
+        retries: 10
+
+volumes:
+  postgres-data:
+  mongo-data:
+  kafka-data:
+  redis-data:

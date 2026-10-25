@@ -1,0 +1,18 @@
+# Profile "local": talks to the containers from docker-compose.yml on your laptop.
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/flashdrop
+    username: flashdrop
+    password: flashdrop
+
+  mongodb:
+    uri: mongodb://localhost:27017/flashdrop
+
+  kafka:
+    bootstrap-servers: localhost:9092
+
+
+  data:
+    redis:
+      host : localhost
+      port : 6379
