@@ -14,6 +14,14 @@ Questions and answers from building flashdrop, organized by phase. Each answer i
   - [Q5. Why package by feature instead of by layer?](#q5-why-package-by-feature-instead-of-by-layer)
   - [Q6. What is Hibernate, and why use Flyway with `ddl-auto: validate` instead of `update`?](#q6-what-is-hibernate-and-why-use-flyway-with-ddl-auto-validate-instead-of-update)
   - [Q7. What happens if I add an entity field but forget the migration?](#q7-what-happens-if-i-add-an-entity-field-but-forget-the-migration)
+- [Phase 1: Domain Model](#phase-1-domain-model)
+  - [Q8. Should stock live on Product or in a separate Inventory table?](#q8-should-stock-live-on-product-or-in-a-separate-inventory-table)
+  - [Q9. Why not FLOAT/DOUBLE for money?](#q9-why-not-floatdouble-for-money)
+  - [Q10. Why add CHECK constraints if Java already validates?](#q10-why-add-check-constraints-if-java-already-validates)
+  - [Q11. TIMESTAMPTZ vs TIMESTAMP: why does the time zone matter?](#q11-timestamptz-vs-timestamp-why-does-the-time-zone-matter)
+  - [Q12. Why not store times as epoch numbers?](#q12-why-not-store-times-as-epoch-numbers)
+  - [Q13. Why no `IF NOT EXISTS` in Flyway migrations?](#q13-why-no-if-not-exists-in-flyway-migrations)
+  - [SQL patterns cheat sheet](#sql-patterns-cheat-sheet)
 - [Mistakes Log](#mistakes-log)
 
 ---
@@ -260,6 +268,206 @@ The important part is **when** it fails: at startup, on your laptop, within seco
 
 ---
 
+## Phase 1: Domain Model
+
+### Q8. Should stock live on Product or in a separate Inventory table?
+
+**Answer.** In a separate `inventory` table, **one row per drop**. The same product (a sneaker) can be released in several drops (500 units in March, 1000 in June), so stock belongs to the drop, not the product.
+
+```mermaid
+erDiagram
+    PRODUCTS ||--o{ DROPS : "released as"
+    DROPS ||--|| INVENTORY : "has stock"
+    DROPS ||--o{ ORDERS : "receives"
+    PRODUCTS {
+        bigint id PK
+        varchar name
+        varchar brand
+        text description
+        varchar image_url
+        timestamptz created_at
+    }
+    DROPS {
+        bigint id PK
+        bigint product_id FK
+        varchar name
+        numeric price
+        timestamptz starts_at
+        timestamptz ends_at
+        int max_per_user
+        varchar status
+        timestamptz created_at
+    }
+    INVENTORY {
+        bigint drop_id PK, FK
+        int total_units
+        int available_units
+    }
+    ORDERS {
+        bigint id PK
+        bigint drop_id FK
+        bigint user_id
+        int quantity
+        numeric unit_price
+        varchar status
+        timestamptz created_at
+        timestamptz updated_at
+    }
+```
+
+**The deeper reason: separate data that changes often from data that rarely changes.**
+
+| | Product | Inventory |
+|---|---|---|
+| Describes | *What* is sold | *How many* are left |
+| Change rate | Rarely | Thousands of writes per second during a drop |
+| Access pattern | Read-heavy, cacheable | Write-heavy, contended, needs locking |
+
+If `stock` lived on `Product`, every purchase would lock the product row, and even viewing the product page would compete with buyers. Splitting them is Single Responsibility at the data level. It also lets `Product` move to MongoDB later while `Inventory` stays in Postgres for ACID guarantees.
+
+> **Interview answer:** "I separate frequently written data from rarely written data. Inventory is a contended, write-heavy row per drop, while the product is read-heavy and cacheable, so locking one never blocks the other."
+
+---
+
+### Q9. Why not FLOAT/DOUBLE for money?
+
+**Answer.** Floating-point numbers are stored in **binary**, and most decimal values (like `0.1`) have no exact binary representation, just as 1/3 has no exact decimal form.
+
+```java
+System.out.println(0.1 + 0.2);   // 0.30000000000000004
+```
+
+Across millions of transactions, these errors add up to real money discrepancies.
+
+| Layer | Use | Never use |
+|---|---|---|
+| PostgreSQL | `NUMERIC(10, 2)`: exact, 10 digits with 2 after the decimal point | `REAL`, `DOUBLE PRECISION` |
+| Java | `BigDecimal` | `double`, `float` |
+
+> **Interview answer:** "Floats are binary approximations, so decimal amounts like 0.1 can't be represented exactly and rounding errors accumulate. I use NUMERIC in the database and BigDecimal in Java."
+
+---
+
+### Q10. Why add CHECK constraints if Java already validates?
+
+**Answer.** Java validation only protects the code paths that go through that Java code. A database constraint protects against **every** writer.
+
+```mermaid
+flowchart LR
+    A["Endpoint with validation"] --> DB
+    B["Future endpoint with a bug (no validation)"] --> DB
+    C["Payment service (Phase 4)"] --> DB
+    D["Manual SQL fix in production"] --> DB
+    E["Two concurrent requests (check-then-act race)"] --> DB
+    DB[("PostgreSQL<br/>CHECK (available_units >= 0)")] -->|"any invalid write"| X["Rejected"]
+```
+
+The race-condition case matters most here. Java's `if (available >= 1)` is a check-then-act, so two threads can both pass it. The database CHECK is evaluated atomically at write time.
+
+| Layer | Purpose |
+|---|---|
+| Java validation | Friendly error messages, fast feedback |
+| Database constraints | Guaranteed integrity: the last line of defence |
+
+> **Interview answer:** "Application validation gives good errors. Database constraints guarantee integrity no matter who writes or how requests interleave. I use both."
+
+---
+
+### Q11. TIMESTAMPTZ vs TIMESTAMP: why does the time zone matter?
+
+**Answer.** `TIMESTAMPTZ` stores an **exact moment in time**. `TIMESTAMP` stores only a **wall-clock reading** with no zone attached.
+
+| Type | What "10:00" means | Risk |
+|---|---|---|
+| `TIMESTAMP` | "10:00", but in which zone? | The server runs in UTC, an admin enters IST, and the drop opens 5.5 hours late |
+| `TIMESTAMPTZ` | Converted to UTC on write (10:00 IST is stored as 04:30 UTC) and converted back to the session zone on read | Everyone agrees on the same instant |
+
+```mermaid
+flowchart LR
+    IN["Admin in India enters<br/>2026-10-26 10:00 +05:30"] --> S[("Stored as<br/>2026-10-26 04:30 UTC")]
+    S --> IND["User in India sees 10:00 IST"]
+    S --> UK["User in London sees 04:30 GMT"]
+```
+
+Note: `TIMESTAMPTZ` doesn't store the zone itself. It converts everything to UTC. In Java, map it to `Instant` (or `OffsetDateTime`).
+
+> **Interview answer:** "I store instants as TIMESTAMPTZ, which normalizes to UTC, so a drop opens at the same moment for every user regardless of server or client time zone."
+
+---
+
+### Q12. Why not store times as epoch numbers?
+
+Epoch means time stored as a number, for example `1793001600000` milliseconds since 1970.
+
+| | `BIGINT` epoch | `TIMESTAMPTZ` |
+|---|---|---|
+| Readable in SQL | No: `1793001600000` | Yes: `2026-10-26 10:00:00+05:30` |
+| Date math (`now() - interval '1 day'`) | Convert first | Built in |
+| Type safety | Any number is accepted. Is it seconds or milliseconds? Mixing them up puts dates 1000× off | Only valid timestamps |
+| Java mapping | `long` | `Instant`, mapped automatically by JPA |
+| Storage | 8 bytes | 8 bytes |
+
+**Where epoch is the right choice:** systems that only understand numbers. In Phase 5, the Redis waiting room uses a **sorted set whose score is the join time in epoch millis**, because sorted sets sort by numeric score.
+
+> **Interview answer:** "In the database I use the native timestamp type for readability, date math and type safety. I use epoch where the system only understands numbers, like Redis sorted-set scores."
+
+---
+
+### Q13. Why no `IF NOT EXISTS` in Flyway migrations?
+
+**Answer.** Flyway already guarantees that each migration runs **exactly once**: it records applied files in `flyway_schema_history` and skips them afterwards. Flyway makes migrations idempotent at the tool level.
+
+`IF NOT EXISTS` would **hide bugs**:
+
+```mermaid
+flowchart TB
+    S["Someone manually created a wrong 'drops' table in production"] --> M{"Migration V1 runs"}
+    M -->|"CREATE TABLE IF NOT EXISTS drops"| Q["Skipped silently. V1 marked successful.<br/>App runs on the wrong schema and nobody knows"]
+    M -->|"CREATE TABLE drops"| L["Fails loudly: relation 'drops' already exists.<br/>Problem found immediately"]
+```
+
+**Where `IF NOT EXISTS` is useful:** scripts run by hand, or setup scripts that no migration tool tracks.
+
+> **Interview answer:** "Flyway tracks applied versions, so each migration runs exactly once. I avoid IF NOT EXISTS because it would mask schema drift. I'd rather fail fast."
+
+---
+
+### SQL patterns cheat sheet
+
+```sql
+-- Auto-generated primary key
+id  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+
+-- Foreign key: this row belongs to an existing row in another table
+product_id  BIGINT NOT NULL REFERENCES products(id),
+
+-- Primary key that is also a foreign key (1:1 relationship)
+drop_id  BIGINT PRIMARY KEY REFERENCES drops(id),
+
+-- Exact money
+price  NUMERIC(10, 2) NOT NULL CHECK (price > 0),
+
+-- Default value plus a rule
+max_per_user  INTEGER NOT NULL DEFAULT 1 CHECK (max_per_user > 0),
+
+-- Only allowed values (enum-like)
+status  VARCHAR(20) NOT NULL CHECK (status IN ('SCHEDULED', 'LIVE', 'ENDED', 'CANCELLED')),
+
+-- Rule across two columns: its own line after the columns
+CHECK (ends_at > starts_at)
+
+-- Composite index for frequent lookups
+CREATE INDEX idx_orders_user_drop ON orders (user_id, drop_id);
+```
+
+**Syntax rules**
+- Every line inside `( ... )` ends with a comma, except the last.
+- `;` goes only after the closing `)`.
+- A foreign key links rows ("this drop belongs to product 5"). It never copies another column's definition.
+- Don't put `DEFAULT now()` on business times such as `starts_at`. They must be set deliberately.
+
+---
+
 ## Mistakes Log
 
 Real mistakes made during the build, kept so they aren't repeated.
@@ -275,3 +483,21 @@ Real mistakes made during the build, kept so they aren't repeated.
 | 0 | `spring.redis` (missing `data:`) | `spring.data.redis` | Wrong paths are silently ignored, not reported |
 | 0 | `host: localhost:6379` | `host: localhost`, plus a separate `port: 6379` | Host and port are separate settings |
 | 0 | Ran curl while the app wasn't running | App in terminal 1, curl in terminal 2 | `spring-boot:run` runs in the foreground |
+| 1 | Foreign-key column with no type (`product_id FOREIGN AS products.id`) | `product_id BIGINT NOT NULL REFERENCES products(id)` | Every column needs a type. A foreign key is written with `REFERENCES` |
+| 1 | `price VARCHAR` | `NUMERIC(10, 2)` with `CHECK (price > 0)` | Text can't be compared numerically or used in math. Use exact decimals for money |
+| 1 | `DEFAULT now()` on `starts_at` / `ends_at` | No default; the times must be given | A forgotten value would start the drop immediately |
+| 1 | `ends_at` declared twice | Declare once, and add `CHECK (ends_at > starts_at)` | Postgres rejects duplicate columns |
+| 1 | `DEFAULT 1 AND > 0;` | `DEFAULT 1 CHECK (max_per_user > 0),` | Rules go in `CHECK (...)`, and `;` would end the whole statement |
+| 1 | Missing comma after `status`, and no allowed values | `CHECK (status IN (...)),` | Every column line needs a comma except the last |
+| 1 | `created_at FOREIGN AS products.created_at` | `created_at TIMESTAMPTZ NOT NULL DEFAULT now()` | A foreign key links rows; it doesn't copy a column definition |
+| 1 | `inventory.drop_id` without `PRIMARY KEY` | `drop_id BIGINT PRIMARY KEY REFERENCES drops(id)` | Without it, one drop could have two stock counters: overselling built into the schema |
+| 1 | `CHECK (available_units > 0 AND available_units < total_units)` | `>= 0 AND <= total_units` | Off-by-one: a fresh drop (500/500) and selling the last unit (0) were both rejected. Run boundary value analysis on every constraint |
+| 1 | `orders.drop_id REFERENCES products(id)` | `REFERENCES drops(id)` | Point each foreign key at the table the row actually belongs to |
+| 1 | `drop_id` copied from the `id` line (`GENERATED ... PRIMARY KEY`) | `drop_id BIGINT NOT NULL REFERENCES drops(id)` | One primary key per table. `GENERATED` is only for the row's own id, never for a pointer |
+| 1 | `REFERENCES` on `unit_price` and `created_at` | No foreign key; `unit_price` is a snapshot copy | Only `_id` columns get `REFERENCES` |
+| 1 | `CREATE INDEX` written inside `CREATE TABLE` | A separate statement after `);`: `CREATE INDEX idx_orders_user_drop ON orders (user_id, drop_id);` | An index is its own statement, with a name and `ON table` |
+| 1 | `=<` | `<=` | Comparison operators are written less-than or greater-than first: `<=`, `>=` |
+| 1 | Leftover `KEY` after deleting `PRIMARY KEY` | Remove it | Re-read the whole line after editing it |
+| 1 | Comma after the last column | No comma before `);` | Every line inside the table ends with a comma except the last |
+
+**Takeaway from Phase 1 schema work:** "It ran without errors" isn't the same as "it's correct". Syntax errors appear immediately; logic errors only appear with data at the boundaries. Test valid and invalid rows against every constraint.
