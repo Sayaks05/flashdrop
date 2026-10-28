@@ -34,6 +34,7 @@ Questions and answers from building flashdrop, organized by phase. Each answer i
   - [Q22. OOP in flashdrop, with real-life examples](#q22-oop-in-flashdrop-with-real-life-examples)
   - [Q23. Order: the starting status, and who owns `createdAt` vs `updatedAt`](#q23-order-the-starting-status-and-who-owns-createdat-vs-updatedat)
   - [Q24. Where should a rule like "only SCHEDULED drops can go LIVE" live?](#q24-where-should-a-rule-like-only-scheduled-drops-can-go-live-live)
+  - [Q25. `cancel()` on an already-CANCELLED drop: throw or do nothing?](#q25-cancel-on-an-already-cancelled-drop-throw-or-do-nothing)
 - [Mistakes Log](#mistakes-log)
 
 ---
@@ -983,6 +984,46 @@ sequenceDiagram
 
 > **Interview answer:** "Rules about one entity's own state live in the entity, behind intention-revealing methods like `goLive()`, with no setters, so they can't be bypassed. Services orchestrate: they load, call domain methods, manage the transaction, and handle rules that span entities or modules."
 
+### Q25. `cancel()` on an already-CANCELLED drop: throw or do nothing?
+
+**Answer.** Do nothing. The first request already did the work, so the second one reaches the same end state and changes nothing. That's **idempotency**: calling the operation once or N times leaves the same result.
+
+**Why it matters:** double-clicks, browser retries, and network timeouts (the client never saw the response, so it sends the request again). If the retry threw an error, the user would see "failed" for something that actually succeeded.
+
+**But only the same transition is idempotent.** Cancelling an ENDED drop is a different, invalid transition, so it still throws:
+
+```java
+public void cancel() {
+    if (status == DropStatus.CANCELLED) {
+        return;                       // already done: idempotent no-op
+    }
+    if (status == DropStatus.ENDED) {
+        throw new IllegalStateException("Drop " + id + " can't be cancelled from " + status);
+    }
+    this.status = DropStatus.CANCELLED;
+}
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> SCHEDULED
+    SCHEDULED --> LIVE: goLive()
+    LIVE --> ENDED: end()
+    SCHEDULED --> CANCELLED: cancel()
+    LIVE --> CANCELLED: cancel()
+    CANCELLED --> CANCELLED: cancel() (no-op)
+    ENDED --> [*]
+    CANCELLED --> [*]
+```
+
+| Call | From | Result |
+|---|---|---|
+| `cancel()` | SCHEDULED, LIVE | becomes CANCELLED |
+| `cancel()` | CANCELLED | nothing (idempotent) |
+| `cancel()` | ENDED | throws (invalid transition) |
+
+> **Interview answer:** "Repeating the same transition to the state it's already in is a no-op, so retries and double-clicks are safe. A transition that's invalid from the current state still throws. Phase 3 takes this further with idempotency keys for non-idempotent operations like placing an order."
+
 ---
 
 ## Mistakes Log
@@ -1028,5 +1069,13 @@ Real mistakes made during the build, kept so they aren't repeated.
 | 1 | `@JoinColumn(name = "drop_id")` on `Long dropId` | `@Column(name = "drop_id", nullable = false)` | `@JoinColumn` is only for relationships. On a plain field Hibernate ignores it, so it worked only by accident |
 | 1 | Column names `"user_Id"`, `"unit_Price"` | `"user_id"`, `"unit_price"` | Copy names exactly from the SQL. Code that works by accident breaks when something unrelated changes |
 | 1 | `import com.flashdrop.catalog.Drop` in the order module (unused) | Remove it | Cross-module imports are the coupling that Q21 avoids |
+| 1 | `drop.getStatus()` inside `Drop` | `status` (or `this.status`) | Inside its own class, an object uses its fields directly. There's no `drop` variable; the object itself is `this` |
+| 1 | `status != "SCHEDULED"` | `status != DropStatus.SCHEDULED` | An enum isn't a String. Comparing an enum to a String never matches (and doesn't compile) |
+| 1 | `throw IllegalStateException(...)` | `throw new IllegalStateException(...)` | An exception is an object, so it needs `new` |
+| 1 | `drop.setStatus()="SCHEDULED"` | `this.status = DropStatus.LIVE;` | You can't assign to a method call. There's no setter on purpose, and the target state is LIVE, not SCHEDULED |
+| 1 | All 3 methods compiled but set the wrong target (`goLive` → SCHEDULED, `end` → LIVE, `cancel` → LIVE) | `LIVE`, `ENDED`, `CANCELLED` | The check guards the *from* state, the assignment sets the *to* state. Compiling proves syntax, not behaviour, so write a unit test per transition |
+| 1 | `"can't go live"` copied into `end()` and `cancel()` | `"can't end from"`, `"can't be cancelled from"` | After copy-pasting, update every line, messages included |
+| 1 | `"Drop" + id + "can't..."` | `"Drop " + id + " can't..."` | String concatenation adds no spaces: it produced `Drop7can't` |
+| 1 | Error message `"Not in Correct State"` | `"Drop " + id + " can't go live from " + status` | Messages should say which object, which action, and which state. Logs are read during incidents |
 
 **Takeaway from Phase 1 schema work:** "It ran without errors" isn't the same as "it's correct". Syntax errors appear immediately; logic errors only appear with data at the boundaries. Test valid and invalid rows against every constraint.
