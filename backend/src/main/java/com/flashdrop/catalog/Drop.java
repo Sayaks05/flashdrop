@@ -55,4 +55,27 @@ public class Drop {
         this.maxPerUser = maxPerUser;
         this.status = DropStatus.SCHEDULED;
     }
+    public void goLive() {
+        if(status!=DropStatus.SCHEDULED){
+            throw new IllegalStateException("Drop " +id+ " can't go live from " + status);
+        }
+        this.status=DropStatus.LIVE;
+    }
+
+    public void end() {
+        if(status!=DropStatus.LIVE){
+            throw new IllegalStateException("Drop " +id+ " can't end from " + status);
+        }
+        this.status=DropStatus.ENDED;
+    }
+
+    public void cancel() {
+        if(status==DropStatus.CANCELLED){
+            return;
+        }
+        if(status==DropStatus.ENDED){
+            throw new IllegalStateException("Drop " +id+ " can't be cancelled from " + status);
+        }
+        this.status=DropStatus.CANCELLED;
+    }
 }
