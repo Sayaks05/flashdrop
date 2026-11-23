@@ -35,6 +35,13 @@ Questions and answers from building flashdrop, organized by phase. Each answer i
   - [Q23. Order: the starting status, and who owns `createdAt` vs `updatedAt`](#q23-order-the-starting-status-and-who-owns-createdat-vs-updatedat)
   - [Q24. Where should a rule like "only SCHEDULED drops can go LIVE" live?](#q24-where-should-a-rule-like-only-scheduled-drops-can-go-live-live)
   - [Q25. `cancel()` on an already-CANCELLED drop: throw or do nothing?](#q25-cancel-on-an-already-cancelled-drop-throw-or-do-nothing)
+  - [Q26. Creating a drop also creates stock: should DropService use InventoryRepository directly, or call an InventoryService?](#q26-creating-a-drop-also-creates-stock-should-dropservice-use-inventoryrepository-directly-or-call-an-inventoryservice)
+  - [Q27. Why a package-private repository plus a public service?](#q27-why-a-package-private-repository-plus-a-public-service)
+  - [Q28. What does `@RequiredArgsConstructor` do, and why constructor injection?](#q28-what-does-requiredargsconstructor-do-and-why-constructor-injection)
+  - [Q29. If saving the Inventory fails, what happens to the Drop that was already saved?](#q29-if-saving-the-inventory-fails-what-happens-to-the-drop-that-was-already-saved)
+  - [Q30. A method with 7 parameters: how do you stop callers passing them in the wrong order?](#q30-a-method-with-7-parameters-how-do-you-stop-callers-passing-them-in-the-wrong-order)
+  - [Q31. Anatomy of `DropService`](#q31-anatomy-of-dropservice-the-request-the-3-fields-requiredargsconstructor-springs-transactional-and-what-belongs-where)
+  - [Q32. Will this project have multithreading?](#q32-will-this-project-have-multithreading)
 - [Mistakes Log](#mistakes-log)
 
 ---
@@ -1024,6 +1031,254 @@ stateDiagram-v2
 
 > **Interview answer:** "Repeating the same transition to the state it's already in is a no-op, so retries and double-clicks are safe. A transition that's invalid from the current state still throws. Phase 3 takes this further with idempotency keys for non-idempotent operations like placing an order."
 
+### Q26. Creating a drop also creates stock: should DropService use InventoryRepository directly, or call an InventoryService?
+
+**Answer.** Call `InventoryService.createStock(dropId, totalUnits)`. Each module owns its own tables and exposes a small public API. Other modules call that API and never touch its repository.
+
+**Real-life example:** a restaurant. The waiter (catalog) passes the order to the kitchen (inventory) and doesn't walk in to cook. Only the kitchen knows its recipes and rules, so if the kitchen changes how it cooks, the waiter is unaffected.
+
+| | (a) DropService uses InventoryRepository | (b) DropService calls InventoryService |
+|---|---|---|
+| Who knows how a stock row is built | Every caller (`availableUnits = totalUnits` copied around) | Only the inventory module |
+| Inventory changes its table | Every caller breaks | Only InventoryService changes |
+| Split into a microservice later | Rewrite every caller | Swap the implementation of one method for an HTTP call or event |
+| Enforce it | `InventoryRepository` stays package-private, so (a) doesn't even compile | ✅ |
+
+```mermaid
+flowchart LR
+    DS[DropService<br/>catalog] -->|createStock dropId, units| IS[InventoryService<br/>inventory, public]
+    IS --> IR[InventoryRepository<br/>package-private]
+    DS -. not allowed .-x IR
+```
+
+**The microservice intuition is right, and it leads to Phase 4.** In this monolith, both saves run in **one** `@Transactional` database transaction: if creating the stock fails, the drop is rolled back too. As separate services with separate databases, a shared transaction isn't possible, so you'd need events plus compensation (the **saga** and **outbox** patterns).
+
+> **Interview answer:** "Modules talk through each other's public service API, never each other's repositories. The owning module keeps its invariants in one place, and the boundary is already where a microservice split would go. In a monolith it's still one ACID transaction; once split, that becomes a saga."
+
+### Q27. Why a package-private repository plus a public service?
+
+**Answer.** Java access modifiers make the compiler enforce the module boundary from Q26.
+
+| Modifier | Who can use it |
+|---|---|
+| `public` | Any class in any package |
+| *(none)*: package-private | Only classes in the **same package** |
+| `private` | Only the same class |
+
+**Real-life example:** a bank. The **counter** (`public InventoryService`) is open to every customer. The **vault** (package-private `InventoryRepository`) is reachable only by staff inside the building (the `inventory` package). A customer can't walk into the vault; the only way in is to ask at the counter, which applies the rules.
+
+```java
+// catalog/DropService.java (different package)
+inventoryService.createStock(dropId, 500);   // ✅ public service: allowed
+inventoryRepository.save(...);               // ❌ compile error: InventoryRepository is not public
+```
+
+```mermaid
+flowchart LR
+    subgraph catalog
+        DS[DropService]
+    end
+    subgraph inventory
+        IS[InventoryService<br/>public]
+        IR[InventoryRepository<br/>package-private]
+        IS --> IR
+    end
+    DS -->|allowed| IS
+    DS -. compile error .-x IR
+```
+
+A rule in a code comment can be forgotten. A rule the compiler enforces can't be broken.
+
+> **Interview answer:** "Each module's repository is package-private and its service is public, so other modules can only reach the data through the service, which owns the rules. The compiler enforces the boundary, not code review."
+
+---
+
+### Q28. What does `@RequiredArgsConstructor` do, and why constructor injection?
+
+**Answer.** Lombok generates a constructor that takes every `final` field. Spring calls that constructor at startup and passes in the dependencies. This is **dependency injection**.
+
+```java
+// You write
+@Service
+@RequiredArgsConstructor
+public class InventoryService {
+    private final InventoryRepository inventoryRepository;
+}
+
+// Lombok generates (invisible)
+public InventoryService(InventoryRepository inventoryRepository) {
+    this.inventoryRepository = inventoryRepository;
+}
+```
+
+**Real-life example:** a new employee. Without injection, they build their own laptop (`new InventoryRepository()`). With injection, HR hands them one, and in a test HR can hand them a dummy laptop (a mock).
+
+```mermaid
+sequenceDiagram
+    participant S as Spring (startup)
+    participant R as InventoryRepository
+    participant I as InventoryService
+    S->>R: create the implementation (Spring Data)
+    S->>I: new InventoryService(repository)
+    Note over I: final field set once, never null
+```
+
+| | Field `@Autowired` | `final` field + constructor |
+|---|---|---|
+| Immutable | ❌ | ✅ |
+| Can exist without the dependency | ✅ (null, crash later) | ❌ can't be created |
+| Unit test without Spring | Hard (reflection) | `new InventoryService(mockRepo)` |
+
+SOLID link: the **D**, Dependency Inversion. The class depends on what it's given, not on what it builds.
+
+> **Interview answer:** "I use constructor injection with final fields, usually through Lombok's `@RequiredArgsConstructor`. Dependencies are mandatory and immutable, and unit tests can pass mocks without starting Spring."
+
+---
+
+### Q29. If saving the Inventory fails, what happens to the Drop that was already saved?
+
+**Answer.** Remove it too: a drop with no stock row is broken data. Put `@Transactional` on `DropService.createDrop()`, so both inserts are in **one** database transaction. That's the **A** in ACID: atomicity, all or nothing.
+
+```mermaid
+sequenceDiagram
+    participant DS as DropService.createDrop() @Transactional
+    participant IS as InventoryService.createStock()
+    participant DB as PostgreSQL
+    DS->>DB: BEGIN
+    DS->>DB: INSERT INTO drops ... (not committed yet)
+    DS->>IS: createStock(dropId, 0)
+    IS->>DB: INSERT INTO inventory ... total_units = 0
+    DB-->>IS: CHECK (total_units > 0) violated
+    IS-->>DS: exception (RuntimeException)
+    DS->>DB: ROLLBACK, so the drop row disappears too
+```
+
+**3 details interviewers check:**
+
+1. **Nothing is committed until the method returns.** Rollback doesn't undo a commit; it discards writes that were never committed.
+2. **Only unchecked exceptions roll back by default** (`RuntimeException` and its subclasses). A checked exception (`extends Exception`) commits unless you add `@Transactional(rollbackFor = Exception.class)`. That's why business exceptions usually extend `RuntimeException`.
+3. **`createStock()` joins the caller's transaction.** The default propagation is `REQUIRED`: it uses the existing transaction if there is one.
+
+**Even better: fail fast.** Validate `totalUnits > 0` at the start of `createDrop()`, before any insert, and throw a business exception with a clear message. The DB `CHECK` stays as the safety net (Q10).
+
+> **Interview answer:** "Both inserts run in one `@Transactional` method, so a failure in the second rolls back the first. Spring rolls back on unchecked exceptions by default, so business exceptions extend `RuntimeException`. I also validate up front so the common error never reaches the database."
+
+---
+
+### Q30. A method with 7 parameters: how do you stop callers passing them in the wrong order?
+
+**Problem.** Java has no named arguments, and `startsAt` and `endsAt` are both `Instant`, so this compiles:
+
+```java
+createDrop(1L, "Jordan", price, endsAt, startsAt, 500, 2);
+//                              ^^^^^^^^^^^^^^^^  swapped: a drop that ends before it starts
+//                                                ^^^^^^ swapped: maxPerUser = 500, totalUnits = 2
+```
+
+The compiler only checks **types**, not **meaning**.
+
+**Fix 1: a parameter object (a `record`).** Bundle the inputs into one object with named fields:
+
+```java
+public record CreateDropRequest(Long productId, String name, BigDecimal price,
+                                Instant startsAt, Instant endsAt,
+                                int maxPerUser, int totalUnits) {}
+
+public Long createDrop(CreateDropRequest request) { ... }
+```
+
+Callers mostly don't build it by hand: the controller gets it from JSON, where every value is **matched by name** (`"startsAt": "..."`), so order can't be wrong. Adding a field later doesn't change the method signature.
+
+**Fix 2: validate the meaning.** Whatever gets past the types gets caught by rules:
+
+| Swap | Rule that catches it |
+|---|---|
+| `startsAt` ↔ `endsAt` | `endsAt` must be after `startsAt` (also `CHECK (ends_at > starts_at)` in the DB) |
+| `maxPerUser` ↔ `totalUnits` | `maxPerUser` must be ≤ `totalUnits` |
+
+**Real-life example:** a paper form with labelled boxes ("Start date: ___") versus a blank line where you write 7 values in the right order from memory.
+
+> **Interview answer:** "Long parameter lists of the same type are a code smell because Java can't catch swapped arguments. I use a parameter object, a record bound from JSON by name, and validate invariants like `endsAt > startsAt` so whatever slips past the types fails fast."
+
+---
+
+### Q31. Anatomy of `DropService`: the request, the 3 fields, `@RequiredArgsConstructor`, Spring's `@Transactional`, and what belongs where
+
+**Real-life example for the whole thing:** a store manager launching a sale. The manager fills in **one form** (the request), uses **3 helpers** (the fields), and makes sure everything happens **all or nothing** (the transaction). The manager doesn't count stock or print price tags; the helpers do.
+
+**1. Why a request object?** It holds what the **caller** decides, and nothing else.
+
+| Field | In `CreateDropRequest`? | Why |
+|---|---|---|
+| `productId`, `name`, `price`, `startsAt`, `endsAt`, `maxPerUser` | ✅ | The admin chooses these |
+| `totalUnits` | ✅ | The admin chooses it, but it's stored in `inventory`, not `drops` |
+| `id` | ❌ | The DB generates it |
+| `status` | ❌ | Always SCHEDULED at creation; the constructor sets it |
+| `createdAt` | ❌ | The DB sets it |
+
+Request (what comes **in**) ≠ entity (what's **stored**). Exposing the entity as the API input would let clients send `status: "ENDED"` or an `id`.
+
+**2. Why these 3 fields?** One per job:
+
+| Field | Job | TODO |
+|---|---|---|
+| `ProductRepository` | Load the product the drop is for | 2 |
+| `DropRepository` | Save the drop | 3 |
+| `InventoryService` | Create the stock row through inventory's public API (not its repository, Q27) | 4 |
+
+**3. Why Spring's `@Transactional` and not `jakarta.transaction.Transactional`?** Both work in Spring. Spring's version has the options needed later: `readOnly`, `isolation` (Phase 2 concurrency), `propagation`, `timeout`, `rollbackFor`. Use one consistently.
+
+**4. Why `@RequiredArgsConstructor`?** See Q28: it generates the constructor for the 3 `final` fields, and Spring fills them in. `@NoArgsConstructor` would leave them unset, which doesn't compile.
+
+**5. Is the service doing too much?** The service should **coordinate**, not hold every rule. Each rule goes in the class that owns the data:
+
+| Rule | Owner | Why |
+|---|---|---|
+| `endsAt` after `startsAt` | `Drop` constructor | About the drop's own fields (Q24) |
+| `totalUnits > 0` | `Inventory` constructor | About inventory's own fields |
+| `maxPerUser <= totalUnits` | `DropService` | Spans two modules |
+| Product exists | `DropService` | Needs a DB lookup |
+
+```mermaid
+flowchart TD
+    C[Controller<br/>JSON to CreateDropRequest] --> DS[DropService.createDrop<br/>@Transactional: coordinates]
+    DS -->|1. load| PR[ProductRepository]
+    DS -->|2. new Drop + save<br/>Drop checks its own dates| DR[DropRepository]
+    DS -->|3. createStock<br/>Inventory checks its own units| IS[InventoryService]
+    IS --> IR[InventoryRepository]
+```
+
+> **Interview answer:** "The controller binds a request DTO, so clients can't set server-owned fields like id or status. The service coordinates one transaction: load, create, save, call other modules through their public services. Single-entity rules live in the entities; only cross-entity rules stay in the service."
+
+---
+
+### Q32. Will this project have multithreading?
+
+**Answer.** Yes, from the very first request, without writing any thread code. Spring Boot's embedded Tomcat runs **each HTTP request on its own thread** (a pool of 200 by default; Java 21+ can use virtual threads with `spring.threads.virtual.enabled: true`).
+
+```mermaid
+flowchart LR
+    U1[User A: Buy] --> T1[Thread 1]
+    U2[User B: Buy] --> T2[Thread 2]
+    U3[User C: Buy] --> T3[Thread 3]
+    T1 --> S[ONE shared OrderService bean]
+    T2 --> S
+    T3 --> S
+    S --> R[(SAME inventory row:<br/>1 unit left)]
+```
+
+| Where | Threads | Phase |
+|---|---|---|
+| HTTP requests | Many at once, all hitting the same inventory row | 2 (locking) |
+| Kafka consumers | Listener threads processing events in parallel | 4 |
+| Scheduler | A background thread that moves drops to LIVE/ENDED on time | 3 |
+| Tests | `ExecutorService` + `CountDownLatch` to fire 100 purchases at once and assert no overselling | 2 |
+| Load test | k6 simulating thousands of users | 7 |
+
+**Why services must be stateless:** a `@Service` is a **singleton**, one object shared by every thread. `final` fields holding other beans are safe. A field holding per-request data (like `private int quantity;`) would be overwritten by other users' threads.
+
+> **Interview answer:** "Every request runs on its own thread against singleton beans, so services stay stateless and shared data like stock is protected in the database with atomic updates or locks. I prove it with a concurrent test that fires many purchases at once and asserts no overselling."
+
 ---
 
 ## Mistakes Log
@@ -1076,6 +1331,17 @@ Real mistakes made during the build, kept so they aren't repeated.
 | 1 | All 3 methods compiled but set the wrong target (`goLive` → SCHEDULED, `end` → LIVE, `cancel` → LIVE) | `LIVE`, `ENDED`, `CANCELLED` | The check guards the *from* state, the assignment sets the *to* state. Compiling proves syntax, not behaviour, so write a unit test per transition |
 | 1 | `"can't go live"` copied into `end()` and `cancel()` | `"can't end from"`, `"can't be cancelled from"` | After copy-pasting, update every line, messages included |
 | 1 | `"Drop" + id + "can't..."` | `"Drop " + id + " can't..."` | String concatenation adds no spaces: it produced `Drop7can't` |
+| 1 | `public interface InventoryRepository` | `interface InventoryRepository` (no modifier) | `public` lets any module bypass `InventoryService`. Copy the access modifier too, not just the generics |
+| 1 | `inventoryRepository = new InventoryService();` | Delete it: Spring already injected the repository | Never `new` an injected dependency. A `final` field can't be reassigned, and the type was wrong (a service, not a repository) |
+| 1 | `inventoryRepository.save(dropId, totalUnits)` | `inventoryRepository.save(new Inventory(dropId, totalUnits));` | `save()` takes an entity object, not raw values. Build the entity with its constructor first |
+| 1 | Missing `;` after a statement | Add `;` | Read the compiler's `[line,column]`: `[15,52] ';' expected` points exactly at it |
+| 1 | Thought `new Inventory(7L, 500)` would fail at runtime | It compiles and runs fine | `new` on an entity just creates a Java object. Only the access modifier (`public` or not) decides whether another module can call `save()` |
+| 1 | `@NoArgsConstructor` on a service with `final` fields | `@RequiredArgsConstructor` | A no-args constructor can't set `final` fields, and Spring couldn't inject anything |
+| 1 | `private final DropRepository dropRepository();` | No `()` | With `()` it's a method declaration, not a field |
+| 1 | `status` and `createdAt` as `createDrop` parameters | Remove them; add `totalUnits` | The constructor sets `status`, the DB sets `created_at` (Q19, Q23) |
+| 1 | `import jakarta.transaction.Transactional` | `org.springframework.transaction.annotation.Transactional` | Use Spring's version in Spring code: it supports `readOnly`, `propagation`, `rollbackFor` |
+| 1 | `.orElse(() throw new ...)` | `.orElseThrow(() -> new ...)` | `orElse` takes a fallback value; `orElseThrow` takes a lambda that *creates* the exception. A lambda is `() -> expression`, and `throw` isn't written inside it |
+| 1 | `new Drop(product, name, price, maxPerUser)` with `startsAt`/`endsAt` missing, and an unclosed `(` | Pass all 6 arguments in the constructor's order, and close every `(` | Check the constructor's signature when calling it. Count the brackets on long lines |
 | 1 | Error message `"Not in Correct State"` | `"Drop " + id + " can't go live from " + status` | Messages should say which object, which action, and which state. Logs are read during incidents |
 
 **Takeaway from Phase 1 schema work:** "It ran without errors" isn't the same as "it's correct". Syntax errors appear immediately; logic errors only appear with data at the boundaries. Test valid and invalid rows against every constraint.
