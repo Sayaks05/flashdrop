@@ -27,6 +27,9 @@ public class Inventory {
     private  int availableUnits;
 
     public Inventory(Long dropId,int totalUnits){
+        if (totalUnits <= 0) {
+            throw new IllegalArgumentException("totalUnits must be > 0");
+        }
         this.totalUnits = totalUnits;
         this.availableUnits = totalUnits;
         this.dropId = dropId;

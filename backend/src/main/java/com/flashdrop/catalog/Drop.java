@@ -47,6 +47,9 @@ public class Drop {
     private Instant createdAt;
 
     public Drop(Product product,String name,BigDecimal price,Instant startsAt,Instant endsAt,int maxPerUser){
+        if (!endsAt.isAfter(startsAt)) {
+            throw new IllegalArgumentException("endsAt must be after startsAt");
+        }
         this.product = product;
         this.name = name;
         this.price = price;
